@@ -1,3 +1,5 @@
+
+//اول نزل npm install cloudinary
 const cloudinary = require("cloudinary").v2;
 
 require("dotenv").config(); 
@@ -13,11 +15,6 @@ cloudinary.config({
 });
 
 
-// cloudinary.config({
-//   cloud_name: 'dn2gccqlw',
-//   api_key: '723175676372248',
-//   api_secret: 'oENnjmF-Jb9xHjK-u66PS9cQb50',
-// });
 
 const opts = {
   overwrite: true,

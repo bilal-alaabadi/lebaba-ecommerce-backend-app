@@ -1,91 +1,239 @@
 const express = require("express");
 const Order = require("./orders.model");
-const verifyToken = require("../middleware/verifyToken");
-const verifyAdmin = require("../middleware/verifyAdmin");
 const router = express.Router();
-const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const axios = require("axios");
 
-// create checkout session
-router.post("/create-checkout-session", async (req, res) => {
-  const { products } = req.body;
+const session = require("express-session");
 
+// إعداد بيانات ثابتة خاصة بـ Thawani
+const THAWANI_API_URL = 'https://uatcheckout.thawani.om/api/v1';
+const THAWANI_API_KEY = 'rRQ26GcsZzoEhbrP2HZvLYDbn9C9et'; // ضع المفتاح الخاص بك هنا
+const PUBLIC_KEY = "HGvTMLDssJghr9tlN9gr4DVYt0qyBy";
+
+// إعداد الجلسة
+router.use(
+  session({
+    secret: "your-secret-key",
+    resave: false,
+    saveUninitialized: true,
+    cookie: { secure: false },
+  })
+);
+
+// Route 1: بدء عملية الدفع
+router.post('/create-thawani-session', async (req, res) => {
   try {
-    const lineItems = products.map((product) => ({
-      price_data: {
-        currency: "usd",
-        product_data: {
-          name: product.name,
-          images: [product.image],
-        },
-        unit_amount: Math.round(product.price * 100),
-      },
-      quantity: product.quantity,
-    }));
-
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: lineItems,
-      mode: "payment",
-      success_url:
-        "https://lebab-frontend-final.vercel.app/success?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: "https://lebab-frontend-final.vercel.app/cancel",
-    });
-
-    res.json({ id: session.id });
-  } catch (error) {
-    console.error("Error creating checkout session:", error);
-    res.status(500).json({ error: "Failed to create checkout session" });
-  }
-});
-
-//  confirm payment
-
-router.post("/confirm-payment", async (req, res) => {
-  const { session_id } = req.body;
-  // console.log(session_id);
-
-  try {
-    const session = await stripe.checkout.sessions.retrieve(session_id, {
-      expand: ["line_items", "payment_intent"],
-    });
-
-    const paymentIntentId = session.payment_intent.id;
-
-    let order = await Order.findOne({ orderId: paymentIntentId });
-
-    if (!order) {
-      const lineItems = session.line_items.data.map((item) => ({
-        productId: item.price.product,
-        quantity: item.quantity,
-      }));
-
-      const amount = session.amount_total / 100;
-
-      order = new Order({
-        orderId: paymentIntentId,
-        products: lineItems,
-        amount: amount,
-        email: session.customer_details.email,
-        status:
-          session.payment_intent.status === "succeeded" ? "pending" : "failed",
-      });
-    } else {
-      order.status =
-        session.payment_intent.status === "succeeded" ? "pending" : "failed";
+    // التحقق من وجود بيانات products في الطلب
+    if (!req.body.products || req.body.products.length === 0) {
+      return res.status(400).json({ error: "Products are required" });
     }
 
-    // Save the order to MongoDB
-    await order.save();
-    //   console.log('Order saved to MongoDB', order);
+    // تحضير البيانات لإرسالها إلى Thawani
+    const data = {
+      client_reference_id: Date.now().toString(), // معرف فريد للجلسة
+      mode: 'payment',
+      products: req.body.products.map(product => ({
+        name: product.name,
+        quantity: product.quantity,
+        unit_amount: Math.round(product.price * 1000), // تحويل السعر إلى البيسة (1000 بيسة = 1 ريال عماني)
+      })),
+      success_url: `${req.protocol}://${req.get('host')}/success`, // رابط النجاح
+      cancel_url: `${req.protocol}://${req.get('host')}/fail`, // رابط الإلغاء
+    };
 
-    res.json({ order });
+    // إرسال الطلب إلى Thawani لإنشاء جلسة دفع
+    const response = await axios.post(`${THAWANI_API_URL}/checkout/session`, data, {
+      headers: {
+        'Content-Type': 'application/json',
+        'thawani-api-key': THAWANI_API_KEY,
+      },
+    });
+
+    // حفظ معرف الجلسة في session
+    req.session.pay_session_id = response.data.data.session_id;
+
+    // إرجاع رابط الدفع كاستجابة JSON
+    const paymentLink = `https://uatcheckout.thawani.om/pay/${response.data.data.session_id}?key=${PUBLIC_KEY}`;
+    res.json({ payment_url: paymentLink });
   } catch (error) {
-    console.error("Error confirming payment:", error);
-    res.status(500).json({ error: "Failed to confirm payment" });
+    console.error('Error creating payment session:', error.response?.data || error.message);
+    res.status(500).json({ error: 'Error creating payment session.' });
   }
 });
 
-// get order by email address
+// Route 2: نجاح الدفع
+router.get('/success', async (req, res) => {
+  try {
+      const sessionId = req.session.pay_session_id;
+
+      const response = await axios.get(`${THAWANI_API_URL}/checkout/session/${sessionId}`, {
+          headers: {
+              'Content-Type': 'application/json',
+              'thawani-api-key': THAWANI_API_KEY
+          }
+      });
+
+      res.json(response.data);
+  } catch (error) {
+      console.error('Error fetching payment success data:', error.response.data || error.message);
+      res.status(500).send('Error fetching payment success data.');
+  }
+});
+
+// Route 3: فشل الدفع
+router.get('/fail', async (req, res) => {
+  try {
+      const sessionId = req.session.pay_session_id;
+
+      const response = await axios.get(`${THAWANI_API_URL}/checkout/session/${sessionId}`, {
+          headers: {
+              'Content-Type': 'application/json',
+              'thawani-api-key': THAWANI_API_KEY
+          }
+      });
+
+      res.json(response.data);
+  } catch (error) {
+      console.error('Error fetching payment failure data:', error.response.data || error.message);
+      res.status(500).send('Error fetching payment failure data.');
+  }
+});
+
+// Route 4: استرداد المبلغ
+router.get('/refund', async (req, res) => {
+  try {
+      const sessionId = req.session.pay_session_id;
+
+      const sessionData = await axios.get(`${THAWANI_API_URL}/checkout/session/${sessionId}`, {
+          headers: {
+              'Content-Type': 'application/json',
+              'thawani-api-key': THAWANI_API_KEY
+          }
+      });
+
+      const paymentObject = await axios.get(`${THAWANI_API_URL}/payments?checkout_invoice=${sessionData.data.data.invoice}`, {
+          headers: {
+              'Content-Type': 'application/json',
+              'thawani-api-key': THAWANI_API_KEY
+          }
+      });
+
+      const payment = paymentObject.data.data[0];
+
+      const refundResponse = await axios.post(`${THAWANI_API_URL}/refunds`, {
+          payment_id: payment.payment_id,
+          reason: 'Refund Requested'
+      }, {
+          headers: {
+              'Content-Type': 'application/json',
+              'thawani-api-key': THAWANI_API_KEY
+          }
+      });
+
+      const refundStatus = await axios.get(`${THAWANI_API_URL}/refunds/${refundResponse.data.data.refund_id}`, {
+          headers: {
+              'Content-Type': 'application/json',
+              'thawani-api-key': THAWANI_API_KEY
+          }
+      });
+
+      res.json(refundStatus.data);
+  } catch (error) {
+      console.error('Error processing refund:', error.response.data || error.message);
+      res.status(500).send('Error processing refund.');
+  }
+});
+
+
+
+// مسار لإنشاء جلسة دفع مع Thawani
+// router.post("/create-thawani-session", async (req, res) => {
+//   const { products } = req.body;
+
+//   if (!products || products.length === 0) {
+//     return res.status(400).json({ error: "Products are required" });
+//   }
+
+//   try {
+//     const lineItems = products.map((product) => ({
+//       name: product.name,
+//       quantity: product.quantity,
+//       unit_amount: Math.round(product.price * 100), // تحويل السعر إلى البيسة
+//     }));
+
+//     const data = {
+//       client_reference_id: Date.now(), // معرف مرجعي للجلسة
+//       mode: "payment",
+//       products: lineItems,
+//       success_url: "http://localhost:5173/success?session_id={CHECKOUT_SESSION_ID}", // سيتم استبدال {CHECKOUT_SESSION_ID} من قبل Thawani
+//       cancel_url: "http://localhost:5173/cancel",
+//     };
+
+//     const response = await axios.post(`${API_URL}/checkout/session`, data, {
+//       headers: {
+//         "Content-Type": "application/json",
+//         "thawani-api-key": API_KEY,
+//       },
+//     });
+
+//     const redirectUrl = `https://uatcheckout.thawani.om/pay/${response.data.data.session_id}?key=${PUBLIC_KEY}`;
+//     res.json({ payment_url: redirectUrl });
+//   } catch (error) {
+//     console.error("Error creating checkout session:", error.response?.data || error.message);
+//     res.status(500).json({ error: "Failed to create checkout session" });
+//   }
+// });
+// // مسار للتحقق من حالة الدفع
+// router.post("/confirm-payment", async (req, res) => {
+//   const { session_id } = req.body;
+
+//   if (!session_id) {
+//     return res.status(400).json({ error: "Session ID is required" });
+//   }
+
+//   try {
+//     const response = await axios.get(`${API_URL}/checkout/session/${session_id}`, {
+//       headers: {
+//         "Content-Type": "application/json",
+//         "thawani-api-key": API_KEY,
+//       },
+//     });
+
+//     const paymentData = response.data;
+
+//     if (paymentData.data.payment_status === "paid") {
+//       // حفظ الطلب في قاعدة البيانات
+//       const order = new Order({
+//         orderId: paymentData.data.client_reference_id,
+//         products: paymentData.data.products,
+//         amount: paymentData.data.total_amount / 100, // تحويل البيسة إلى الريال العماني
+//         status: "completed",
+//       });
+
+//       await order.save();
+
+//       res.json({
+//         success: true,
+//         order: order,
+//       });
+//     } else {
+//       res.json({
+//         success: false,
+//         message: "Payment not successful",
+//       });
+//     }
+//   } catch (error) {
+//     console.error("Error confirming payment:", error.response?.data || error.message);
+//     res.status(500).json({ error: "Failed to confirm payment" });
+//   }
+// });
+
+// مسارات أخرى (يمكن إضافتها حسب الحاجة)
+// ...
+
+
+// تقديم صفحة React عند المسارات غير المعروفة
+
 router.get("/:email", async (req, res) => {
   const email = req.params.email;
   if (!email) {
@@ -191,6 +339,5 @@ router.delete('/delete-order/:id', async( req, res) => {
     res.status(500).send({ message: "Failed to delete order" });
   }
 } )
-
 
 module.exports = router;

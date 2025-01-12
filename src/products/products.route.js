@@ -6,24 +6,55 @@ const verifyAdmin = require("../middleware/verifyAdmin");
 const router = express.Router();
 
 // post a product
+const { uploadImages } = require("../utils/uploadImage");
+
+router.post("/uploadImages", async (req, res) => {
+    try {
+        const { images } = req.body; // images هي مصفوفة من base64
+        if (!images || !Array.isArray(images)) {
+            return res.status(400).send({ message: "يجب إرسال مصفوفة من الصور" });
+        }
+
+        const uploadedUrls = await uploadImages(images);
+        res.status(200).send(uploadedUrls);
+    } catch (error) {
+        console.error("Error uploading images:", error);
+        res.status(500).send({ message: "حدث خطأ أثناء تحميل الصور" });
+    }
+});
+
+// نقطة النهاية لإنشاء منتج
 router.post("/create-product", async (req, res) => {
   try {
+    const { name, category, description, price, oldPrice, image, color, author } = req.body;
+
+    // تحقق من الحقول المطلوبة
+    if (!name || !category || !description || !price || !image || !author) {
+      return res.status(400).send({ message: "جميع الحقول المطلوبة يجب إرسالها" });
+    }
+
     const newProduct = new Products({
-      ...req.body,
+      name,
+      category,
+      description,
+      price,
+      oldPrice,
+      image, // يجب أن تكون مصفوفة من روابط الصور
+      color,
+      author,
     });
 
     const savedProduct = await newProduct.save();
-    // calculate review
+
+    // حساب التقييمات إذا وجدت
     const reviews = await Reviews.find({ productId: savedProduct._id });
     if (reviews.length > 0) {
-      const totalRating = reviews.reduce(
-        (acc, review) => acc + review.rating,
-        0
-      );
+      const totalRating = reviews.reduce((acc, review) => acc + review.rating, 0);
       const averageRating = totalRating / reviews.length;
       savedProduct.rating = averageRating;
       await savedProduct.save();
     }
+
     res.status(201).send(savedProduct);
   } catch (error) {
     console.error("Error creating new product", error);

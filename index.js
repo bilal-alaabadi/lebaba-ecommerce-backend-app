@@ -15,14 +15,14 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(
     cors({
-        origin: "https://lebab-frontend-final.vercel.app",//مال الفرونت اند
+        origin: "https://www.royasow.store",//مال الفرونت اند
         credentials: true,
     })
 );
 
 // دعم طلبات OPTIONS (Preflight Requests)
 app.options('*', (req, res) => {
-    res.header('Access-Control-Allow-Origin', 'https://lebab-frontend-final.vercel.app');
+    res.header('Access-Control-Allow-Origin', 'https://www.royasow.store');
     res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.send();

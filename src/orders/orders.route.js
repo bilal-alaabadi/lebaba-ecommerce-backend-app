@@ -51,8 +51,8 @@ router.post("/create-checkout-session", async (req, res) => {
             payment_method_types: ["card"],
             line_items: lineItems,
             mode: "payment",
-            success_url: "http://localhost:5173/success?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url: "http://localhost:5173/cancel",
+            success_url: "https://lebaba-ecommerce-backend-app-snowy.vercel.app/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url: "https://lebaba-ecommerce-backend-app-snowy.vercel.app/cancel",
             metadata: {
                 province,
                 wilayat,

@@ -1,343 +1,274 @@
 const express = require("express");
 const Order = require("./orders.model");
+const verifyToken = require("../middleware/verifyToken");
+const verifyAdmin = require("../middleware/verifyAdmin");
 const router = express.Router();
-const axios = require("axios");
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+// const nodemailer = require("nodemailer");
 
-const session = require("express-session");
+// // إعداد nodemailer
+// const transporter = nodemailer.createTransport({
+//     service: 'gmail', // يمكنك استخدام أي خدمة أخرى مثل Outlook أو Yahoo
+//     auth: {
+//         user: process.env.EMAIL_USER, // البريد الإلكتروني الخاص بك
+//         pass: process.env.EMAIL_PASS, // كلمة المرور الخاصة بالبريد الإلكتروني
+//     },
+// });
 
-// إعداد بيانات ثابتة خاصة بـ Thawani
-const THAWANI_API_URL = 'https://uatcheckout.thawani.om/api/v1';
-const THAWANI_API_KEY = 'rRQ26GcsZzoEhbrP2HZvLYDbn9C9et'; // ضع المفتاح الخاص بك هنا
-const PUBLIC_KEY = "HGvTMLDssJghr9tlN9gr4DVYt0qyBy";
 
-// إعداد الجلسة
-router.use(
-  session({
-    secret: "your-secret-key",
-    resave: false,
-    saveUninitialized: true,
-    cookie: { secure: false },
-  })
-);
+// create checkout session
+router.post("/create-checkout-session", async (req, res) => {
+    const { products, province, wilayat, streetAddress, phone, email, orderNotes, firstName, lastName } = req.body;
 
-// Route 1: بدء عملية الدفع
-router.post('/create-thawani-session', async (req, res) => {
-  try {
-    // التحقق من وجود بيانات products في الطلب
-    if (!req.body.products || req.body.products.length === 0) {
-      return res.status(400).json({ error: "Products are required" });
+    console.log("Products received in server:", JSON.stringify(products, null, 2));
+
+    if (!products || products.length === 0) {
+        return res.status(400).json({ error: "No products found in the request" });
     }
 
-    // تحضير البيانات لإرسالها إلى Thawani
-    const data = {
-      client_reference_id: Date.now().toString(), // معرف فريد للجلسة
-      mode: 'payment',
-      products: req.body.products.map(product => ({
-        name: product.name,
-        quantity: product.quantity,
-        unit_amount: Math.round(product.price * 1000), // تحويل السعر إلى البيسة (1000 بيسة = 1 ريال عماني)
-      })),
-      success_url: `${req.protocol}://${req.get('host')}/success`, // رابط النجاح
-      cancel_url: `${req.protocol}://${req.get('host')}/fail`, // رابط الإلغاء
-    };
+    try {
+        const lineItems = products.map((product) => {
+            const imageUrl = Array.isArray(product.image) ? product.image[0] : product.image;
 
-    // إرسال الطلب إلى Thawani لإنشاء جلسة دفع
-    const response = await axios.post(`${THAWANI_API_URL}/checkout/session`, data, {
-      headers: {
-        'Content-Type': 'application/json',
-        'thawani-api-key': THAWANI_API_KEY,
-      },
-    });
+            if (!imageUrl || typeof imageUrl !== 'string') {
+                throw new Error(`Invalid image URL for product: ${product.name}`);
+            }
 
-    // حفظ معرف الجلسة في session
-    req.session.pay_session_id = response.data.data.session_id;
+            return {
+                price_data: {
+                    currency: "usd",
+                    product_data: {
+                        name: product.name,
+                        images: [imageUrl],
+                    },
+                    unit_amount: Math.round(product.price * 100), // السعر يجب أن يكون بالسنتات
+                },
+                quantity: product.quantity,
+            };
+        });
 
-    // إرجاع رابط الدفع كاستجابة JSON
-    const paymentLink = `https://uatcheckout.thawani.om/pay/${response.data.data.session_id}?key=${PUBLIC_KEY}`;
-    res.json({ payment_url: paymentLink });
-  } catch (error) {
-    console.error('Error creating payment session:', error.response?.data || error.message);
-    res.status(500).json({ error: 'Error creating payment session.' });
-  }
+        const session = await stripe.checkout.sessions.create({
+            payment_method_types: ["card"],
+            line_items: lineItems,
+            mode: "payment",
+            success_url: "http://localhost:5173/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url: "http://localhost:5173/cancel",
+            metadata: {
+                province,
+                wilayat,
+                streetAddress,
+                phone,
+                email,
+                orderNotes,
+                firstName,
+                lastName,
+            },
+        });
+
+        console.log("Stripe session created:", session.id);
+
+        // إنشاء الطلب وحفظه في قاعدة البيانات
+        const order = new Order({
+            orderId: session.id, // استخدام معرف الجلسة كمعرف للطلب
+            firstName,
+            lastName,
+            products: products.map((product) => ({
+                productId: product._id, // استخدام _id بدلاً من id
+                quantity: product.quantity,
+            })),
+            amount: products.reduce((total, product) => total + product.price * product.quantity, 0), // حساب المبلغ الإجمالي
+            email,
+            phoneNumber: phone,
+            shippingAddress: {
+                country: "Oman",
+                province,
+                wilayat,
+                streetAddress,
+            },
+            orderNotes,
+            status: "pending", // الحالة الافتراضية
+        });
+
+        await order.save(); // حفظ الطلب في قاعدة البيانات
+        console.log("Order saved to database:", order);
+
+        res.json({ id: session.id });
+    } catch (error) {
+        console.error("Error creating checkout session or saving order:", error);
+        res.status(500).json({ error: "Failed to create checkout session or save order", details: error.message });
+    }
 });
 
-// Route 2: نجاح الدفع
-router.get('/success', async (req, res) => {
-  try {
-      const sessionId = req.session.pay_session_id;
+// تأكيد الدفع
+router.post("/confirm-payment", async (req, res) => {
+    const { session_id } = req.body;
 
-      const response = await axios.get(`${THAWANI_API_URL}/checkout/session/${sessionId}`, {
-          headers: {
-              'Content-Type': 'application/json',
-              'thawani-api-key': THAWANI_API_KEY
-          }
-      });
+    if (!session_id) {
+        console.error("Session ID is required");
+        return res.status(400).json({ error: "Session ID is required" });
+    }
 
-      res.json(response.data);
-  } catch (error) {
-      console.error('Error fetching payment success data:', error.response.data || error.message);
-      res.status(500).send('Error fetching payment success data.');
-  }
-});
+    try {
+        // استرجاع بيانات الجلسة من Stripe
+        const session = await stripe.checkout.sessions.retrieve(session_id, {
+            expand: ["line_items", "payment_intent"],
+        });
 
-// Route 3: فشل الدفع
-router.get('/fail', async (req, res) => {
-  try {
-      const sessionId = req.session.pay_session_id;
+        if (!session.payment_intent) {
+            console.error("Payment intent not found in session");
+            return res.status(400).json({ error: "Payment intent not found in session" });
+        }
 
-      const response = await axios.get(`${THAWANI_API_URL}/checkout/session/${sessionId}`, {
-          headers: {
-              'Content-Type': 'application/json',
-              'thawani-api-key': THAWANI_API_KEY
-          }
-      });
+        const paymentIntentId = session.payment_intent.id;
 
-      res.json(response.data);
-  } catch (error) {
-      console.error('Error fetching payment failure data:', error.response.data || error.message);
-      res.status(500).send('Error fetching payment failure data.');
-  }
-});
+        // البحث عن الطلب في قاعدة البيانات
+        let order = await Order.findOne({ orderId: paymentIntentId });
 
-// Route 4: استرداد المبلغ
-router.get('/refund', async (req, res) => {
-  try {
-      const sessionId = req.session.pay_session_id;
+        if (!order) {
+            // إنشاء طلب جديد إذا لم يتم العثور عليه
+            const lineItems = session.line_items.data.map((item) => ({
+                productId: item.price.product,
+                quantity: item.quantity,
+            }));
 
-      const sessionData = await axios.get(`${THAWANI_API_URL}/checkout/session/${sessionId}`, {
-          headers: {
-              'Content-Type': 'application/json',
-              'thawani-api-key': THAWANI_API_KEY
-          }
-      });
+            const amount = session.amount_total / 100;
 
-      const paymentObject = await axios.get(`${THAWANI_API_URL}/payments?checkout_invoice=${sessionData.data.data.invoice}`, {
-          headers: {
-              'Content-Type': 'application/json',
-              'thawani-api-key': THAWANI_API_KEY
-          }
-      });
+            order = new Order({
+                orderId: paymentIntentId,
+                products: lineItems,
+                amount: amount,
+                email: session.customer_details.email || session.metadata.email,
+                phoneNumber: session.metadata.phone || "N/A",
+                shippingAddress: {
+                    country: session.metadata.country || "Oman",
+                    province: session.metadata.province || "N/A",
+                    wilayat: session.metadata.wilayat || "N/A",
+                    streetAddress: session.metadata.streetAddress || "N/A",
+                },
+                orderNotes: session.metadata.orderNotes || "No notes provided",
+                firstName: session.metadata.firstName || "N/A", // إضافة firstName
+                lastName: session.metadata.lastName || "N/A", // إضافة lastName
+                status: session.payment_intent.status === "succeeded" ? "pending" : "failed",
+            });
+        } else {
+            // تحديث حالة الطلب إذا تم العثور عليه
+            order.status = session.payment_intent.status === "succeeded" ? "pending" : "failed";
+        }
 
-      const payment = paymentObject.data.data[0];
+        await order.save(); // حفظ الطلب في قاعدة البيانات
+        console.log("Order saved to database:", order);
 
-      const refundResponse = await axios.post(`${THAWANI_API_URL}/refunds`, {
-          payment_id: payment.payment_id,
-          reason: 'Refund Requested'
-      }, {
-          headers: {
-              'Content-Type': 'application/json',
-              'thawani-api-key': THAWANI_API_KEY
-          }
-      });
-
-      const refundStatus = await axios.get(`${THAWANI_API_URL}/refunds/${refundResponse.data.data.refund_id}`, {
-          headers: {
-              'Content-Type': 'application/json',
-              'thawani-api-key': THAWANI_API_KEY
-          }
-      });
-
-      res.json(refundStatus.data);
-  } catch (error) {
-      console.error('Error processing refund:', error.response.data || error.message);
-      res.status(500).send('Error processing refund.');
-  }
+        res.json({ order });
+    } catch (error) {
+        console.error("Error confirming payment:", error);
+        res.status(500).json({ error: "Failed to confirm payment", details: error.message });
+    }
 });
 
 
-
-// مسار لإنشاء جلسة دفع مع Thawani
-// router.post("/create-thawani-session", async (req, res) => {
-//   const { products } = req.body;
-
-//   if (!products || products.length === 0) {
-//     return res.status(400).json({ error: "Products are required" });
-//   }
-
-//   try {
-//     const lineItems = products.map((product) => ({
-//       name: product.name,
-//       quantity: product.quantity,
-//       unit_amount: Math.round(product.price * 100), // تحويل السعر إلى البيسة
-//     }));
-
-//     const data = {
-//       client_reference_id: Date.now(), // معرف مرجعي للجلسة
-//       mode: "payment",
-//       products: lineItems,
-//       success_url: "http://localhost:5173/success?session_id={CHECKOUT_SESSION_ID}", // سيتم استبدال {CHECKOUT_SESSION_ID} من قبل Thawani
-//       cancel_url: "http://localhost:5173/cancel",
-//     };
-
-//     const response = await axios.post(`${API_URL}/checkout/session`, data, {
-//       headers: {
-//         "Content-Type": "application/json",
-//         "thawani-api-key": API_KEY,
-//       },
-//     });
-
-//     const redirectUrl = `https://uatcheckout.thawani.om/pay/${response.data.data.session_id}?key=${PUBLIC_KEY}`;
-//     res.json({ payment_url: redirectUrl });
-//   } catch (error) {
-//     console.error("Error creating checkout session:", error.response?.data || error.message);
-//     res.status(500).json({ error: "Failed to create checkout session" });
-//   }
-// });
-// // مسار للتحقق من حالة الدفع
-// router.post("/confirm-payment", async (req, res) => {
-//   const { session_id } = req.body;
-
-//   if (!session_id) {
-//     return res.status(400).json({ error: "Session ID is required" });
-//   }
-
-//   try {
-//     const response = await axios.get(`${API_URL}/checkout/session/${session_id}`, {
-//       headers: {
-//         "Content-Type": "application/json",
-//         "thawani-api-key": API_KEY,
-//       },
-//     });
-
-//     const paymentData = response.data;
-
-//     if (paymentData.data.payment_status === "paid") {
-//       // حفظ الطلب في قاعدة البيانات
-//       const order = new Order({
-//         orderId: paymentData.data.client_reference_id,
-//         products: paymentData.data.products,
-//         amount: paymentData.data.total_amount / 100, // تحويل البيسة إلى الريال العماني
-//         status: "completed",
-//       });
-
-//       await order.save();
-
-//       res.json({
-//         success: true,
-//         order: order,
-//       });
-//     } else {
-//       res.json({
-//         success: false,
-//         message: "Payment not successful",
-//       });
-//     }
-//   } catch (error) {
-//     console.error("Error confirming payment:", error.response?.data || error.message);
-//     res.status(500).json({ error: "Failed to confirm payment" });
-//   }
-// });
-
-// مسارات أخرى (يمكن إضافتها حسب الحاجة)
-// ...
-
-
-// تقديم صفحة React عند المسارات غير المعروفة
-
+// get order by email address
 router.get("/:email", async (req, res) => {
-  const email = req.params.email;
-  if (!email) {
-    return res.status(400).send({ message: "Email is required" });
-  }
-
-  try {
-    const orders = await Order.find({ email: email });
-
-    if (orders.length === 0 || !orders) {
-      return res
-        .status(400)
-        .send({ orders: 0, message: "No orders found for this email" });
+    const email = req.params.email;
+    if (!email) {
+        return res.status(400).send({ message: "Email is required" });
     }
-    res.status(200).send({ orders });
-  } catch (error) {
-    console.error("Error fetching orders by email", error);
-    res.status(500).send({ message: "Failed to fetch orders by email" });
-  }
+
+    try {
+        const orders = await Order.find({ email: email });
+
+        if (orders.length === 0 || !orders) {
+            return res.status(400).send({ orders: 0, message: "No orders found for this email" });
+        }
+        res.status(200).send({ orders });
+    } catch (error) {
+        console.error("Error fetching orders by email", error);
+        res.status(500).send({ message: "Failed to fetch orders by email" });
+    }
 });
 
 // get order by id
 router.get("/order/:id", async (req, res) => {
-  try {
-    const order = await Order.findById(req.params.id);
-    if (!order) {
-      return res.status(404).send({ message: "Order not found" });
+    try {
+        const order = await Order.findById(req.params.id);
+        if (!order) {
+            return res.status(404).send({ message: "Order not found" });
+        }
+        res.status(200).send(order);
+    } catch (error) {
+        console.error("Error fetching orders by user id", error);
+        res.status(500).send({ message: "Failed to fetch orders by user id" });
     }
-    res.status(200).send(order);
-  } catch (error) {
-    console.error("Error fetching orders by user id", error);
-    res.status(500).send({ message: "Failed to fetch orders by user id" });
-  }
 });
 
 // get all orders
 router.get("/", async (req, res) => {
-  try {
-    const orders = await Order.find().sort({ createdAt: -1 });
-    if (orders.length === 0) {
-      return res.status(404).send({ message: "No orders found", orders: [] });
-    }
+    try {
+        const orders = await Order.find().sort({ createdAt: -1 });
+        if (orders.length === 0) {
+            return res.status(404).send({ message: "No orders found", orders: [] });
+        }
 
-    res.status(200).send(orders);
-  } catch (error) {
-    console.error("Error fetching all orders", error);
-    res.status(500).send({ message: "Failed to fetch all orders" });
-  }
+        res.status(200).send(orders);
+    } catch (error) {
+        console.error("Error fetching all orders", error);
+        res.status(500).send({ message: "Failed to fetch all orders" });
+    }
 });
 
 // update order status
 router.patch("/update-order-status/:id", async (req, res) => {
-  const { id } = req.params;
-  const { status } = req.body;
-  if (!status) {
-    return res.status(400).send({ message: "Status is required" });
-  }
-
-  try {
-    const updatedOrder = await Order.findByIdAndUpdate(
-      id,
-      {
-        status,
-        updatedAt: new Date(),
-      },
-      {
-        new: true,
-        runValidators: true,
-      }
-    );
-
-    if(!updatedOrder) {
-      return res.status(404).send({ message: "Order not found" });
+    const { id } = req.params;
+    const { status } = req.body;
+    if (!status) {
+        return res.status(400).send({ message: "Status is required" });
     }
 
-    res.status(200).json({
-      message: "Order status updated successfully",
-      order: updatedOrder
-    })
+    try {
+        const updatedOrder = await Order.findByIdAndUpdate(
+            id,
+            {
+                status,
+                updatedAt: new Date(),
+            },
+            {
+                new: true,
+                runValidators: true,
+            }
+        );
 
-  } catch (error) {
-    console.error("Error updating order status", error);
-    res.status(500).send({ message: "Failed to update order status" });
-  }
+        if (!updatedOrder) {
+            return res.status(404).send({ message: "Order not found" });
+        }
+
+        res.status(200).json({
+            message: "Order status updated successfully",
+            order: updatedOrder
+        });
+
+    } catch (error) {
+        console.error("Error updating order status", error);
+        res.status(500).send({ message: "Failed to update order status" });
+    }
 });
 
 // delete order
-router.delete('/delete-order/:id', async( req, res) => {
-  const { id } = req.params;
+router.delete('/delete-order/:id', async (req, res) => {
+    const { id } = req.params;
 
-  try {
-    const deletedOrder = await Order.findByIdAndDelete(id);
-    if (!deletedOrder) {
-      return res.status(404).send({ message: "Order not found" });
+    try {
+        const deletedOrder = await Order.findByIdAndDelete(id);
+        if (!deletedOrder) {
+            return res.status(404).send({ message: "Order not found" });
+        }
+        res.status(200).json({
+            message: "Order deleted successfully",
+            order: deletedOrder
+        });
+
+    } catch (error) {
+        console.error("Error deleting order", error);
+        res.status(500).send({ message: "Failed to delete order" });
     }
-    res.status(200).json({
-      message: "Order deleted successfully",
-      order: deletedOrder
-    })
-    
-  } catch (error) {
-    console.error("Error deleting order", error);
-    res.status(500).send({ message: "Failed to delete order" });
-  }
-} )
+});
 
 module.exports = router;

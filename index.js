@@ -36,13 +36,6 @@ app.use("/api/reviews", reviewRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/stats", statsRoutes);
 
-// خدمة الملفات الثابتة (مثل ملفات React)
-app.use(express.static(path.join(__dirname, "build")));
-
-// إعادة توجيه جميع الطلبات إلى index.html
-app.get("*", (req, res) => {
-    res.sendFile(path.join(__dirname, "build", "index.html"));
-});
 
 // الاتصال بقاعدة البيانات
 main()
@@ -53,7 +46,7 @@ async function main() {
     await mongoose.connect(process.env.DB_URL);
 
     app.get("/", (req, res) => {
-        res.send("Lebaba E-commerce Server is running....!");
+        res.send("يعمل الان");
     });
 }
 
